@@ -1,3 +1,29 @@
+ARCHITECTURE.md
+ARCHITECTURE_SIMPLE.md
+FAQ_MODEL_AND_BINDING.md
+HOMEWORK3_IMPLEMENTATION_DETAIL.md
+HOMEWORK3_IMPLEMENTATION_GUIDE.md
+HOMEWORK3_WALKTHROUGH.md
+HOW_TO_FIND_HF_MODELING_CODE.md
+INFERENCE_FRAMEWORK_TASK_TABLE.md
+LEARN_MODEL_STRUCTURE_STEPS.md
+LINEAR_OPERATOR_NOTES.md
+MINI_VLLM_PROJECT.md
+OPERATOR_ARCHITECTURE.md
+VLLM_LEARNING_PLAN.md
+README_ZN.md
+# 模型权重
+model.safetensors
+*.safetensors
+# 辅助脚本与 IDE/构建生成
+.clangd
+compile_commands.json
+clean.sh
+scripts/inspect_safetensors.py
+
+# -----------------------------------------------------------------------------
+# 构建与二进制
+# -----------------------------------------------------------------------------
 # Xmake cache
 .xmake/
 build/
@@ -15,6 +41,9 @@ lib/
 
 # Vscode
 .vscode/
+# But keep configuration files
+!.vscode/c_cpp_properties.json
+!.vscode/settings.json
 
 # Python
 __pycache__/
@@ -77,10 +106,12 @@ htmlcov/
 
 # IDE and editor settings
 .vscode/
+# But keep configuration files
+!.vscode/c_cpp_properties.json
+!.vscode/settings.json
 .idea/
 *.swp
 *~
-
 # macOS
 .DS_Store
 
