@@ -33,7 +33,7 @@ static void linear_f32_blocked(float *out,
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (M >= 64)
 #endif
-        for (size_t i = 0; i < M; i++) {
+        for (int i = 0; i < static_cast<int>(M); i++) {
             for (size_t j = 0; j < N; j++) {
                 out[i * N + j] = bias[j];
             }
@@ -42,7 +42,7 @@ static void linear_f32_blocked(float *out,
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (M >= 64)
 #endif
-        for (size_t i = 0; i < M; i++) {
+        for (int i = 0; i < static_cast<int>(M); i++) {
             for (size_t j = 0; j < N; j++) {
                 out[i * N + j] = 0.0f;
             }
@@ -51,7 +51,7 @@ static void linear_f32_blocked(float *out,
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (M >= 2 * kBlock)
 #endif
-    for (size_t ib = 0; ib < M; ib += kBlock) {
+    for (int ib = 0; ib < static_cast<int>(M); ib += static_cast<int>(kBlock)) {
         size_t ie = (std::min)(ib + kBlock, M);
         for (size_t kb = 0; kb < K; kb += kBlock) {
             size_t ke = (std::min)(kb + kBlock, K);
@@ -83,7 +83,7 @@ static void linear_naive(T *out,
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (M >= 64)
 #endif
-    for (size_t i = 0; i < M; i++) {
+    for (int i = 0; i < static_cast<int>(M); i++) {
         for (size_t j = 0; j < N; j++) {
             float sum = 0.0f;
             if (bias != nullptr) {
@@ -124,7 +124,7 @@ static void linear_f32_openblas(float *out,
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (M >= 64)
 #endif
-        for (size_t i = 0; i < M; i++) {
+        for (int i = 0; i < static_cast<int>(M); i++) {
             for (size_t j = 0; j < N; j++) {
                 out[i * N + j] += bias[j];
             }
