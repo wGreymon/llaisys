@@ -45,7 +45,7 @@ void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias) {
                     in->shape()[1]);
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
-        TODO()
+        TO_BE_IMPLEMENTED();
         return;
 #endif
     default:

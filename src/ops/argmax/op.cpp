@@ -4,6 +4,7 @@
 #include "../../utils.hpp"
 
 #include "cpu/argmax_cpu.hpp"
+#include "nvidia/argmax_nvidia.hpp"
 #include "llaisys.h"
 
 // 参数检验+设备分发
@@ -26,12 +27,7 @@ void argmax(tensor_t max_idx, tensor_t max_val, tensor_t vals) {
            "max_idx, max_val and vals must be contiguous");
 
     // 5. 设置上下文，切换当前计算上下文到张量所在设备
-    // always support cpu
     llaisys::core::context().setDevice(vals->deviceType(), vals->deviceId());
-    // if (vals->deviceType() == LLAISYS_DEVICE_CPU) {
-    //     return cpu::argmax(reinterpret_cast<int64_t*>(max_idx->data()), max_val->data(), vals->data(), 
-    //                        vals->dtype(), vals->numel());
-    // }
     
     switch (vals->deviceType()) {
     case LLAISYS_DEVICE_CPU:
@@ -39,15 +35,12 @@ void argmax(tensor_t max_idx, tensor_t max_val, tensor_t vals) {
                      vals->dtype(), vals->numel());
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
-        TO_BE_IMPLEMENTED();
-        return;
+        return nvidia::argmax(reinterpret_cast<int64_t*>(max_idx->data()), reinterpret_cast<std::byte*>(max_val->data()), reinterpret_cast<const std::byte*>(vals->data()), 
+                     vals->dtype(), vals->numel());
 #endif
     default:
         EXCEPTION_UNSUPPORTED_DEVICE;
     }
 
-
-    // TODO：支持高维张量
-    // TODO：支持GPU设备
 }
 } // namespace llaisys::ops

@@ -144,7 +144,7 @@ class Qwen2:
                     skipped += 1
                     continue
 
-                suffix = ".".join(parts[3:])
+                suffix = ".".join(parts[3:])    # 用'.'拼接层号后的元素
 
                 if suffix == "input_layernorm.weight":
                     lt = load_llaisys_tensor_from_torch(t)

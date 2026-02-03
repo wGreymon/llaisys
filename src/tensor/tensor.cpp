@@ -190,7 +190,7 @@ bool Tensor::isContiguous() const {
     ptrdiff_t expected_stride = 1;
 
     // 从后往前检查(逐步升维)
-    for (int i = tensor_ndim - 1; i >= 0; i--) {
+    for (ptrdiff_t i = static_cast<ptrdiff_t>(tensor_ndim) - 1; i >= 0; i--) {
         if (tensor_strides[i] != expected_stride) {
             return false;
         }
