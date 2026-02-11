@@ -1,112 +1,73 @@
-#include "argmax_nvidia.hpp"
-
+#include "argmax_nvidia.cuh"
 #include "../../../utils.hpp"
 #include "../../../utils/gpu_utils.hpp"
-
+#include <cstdint>
 
 namespace {
 
-// Convert stored types to float for comparison
-__device__ inline float to_float(float v) {
-    return v;
-}
-
-__device__ inline float to_float(llaisys::fp16_t v) {
-    union {
-        __half h;
-        uint16_t u;
-    } x;
-    x.u = v._v;
-    return __half2float(x.h);
-}
-
-__device__ inline float to_float(llaisys::bf16_t v) {
-    union {
-        __nv_bfloat16 b;
-        uint16_t u;
-    } x;
-    x.u = v._v;
-    return __bfloat162float(x.b);
-}
-
 template <typename T>
-__device__ inline T zero_value() {
-    return T{0};
-}
-
-template <>
-__device__ inline float zero_value<float>() {
-    return 0.0f;
-}
-
-// Single-block argmax reduction over `numel` elements.
-// Each thread processes a strided subset and we reduce in shared memory.
-template <typename T>
-__global__ void argmax_kernel(const T *vals, size_t numel, int64_t *out_idx, T *out_val) {
-    extern __shared__ unsigned char smem[];
-    T *s_vals = reinterpret_cast<T *>(smem);
-    int64_t *s_idx = reinterpret_cast<int64_t *>(s_vals + blockDim.x);
-
-    const unsigned int tid = threadIdx.x;
-    const unsigned int stride = blockDim.x;
-
-    if (numel == 0) {
-        if (tid == 0) {
-            *out_idx = 0;
-            *out_val = zero_value<T>();
+__device__ __forceinline__ void warp_argmax(T local_val, int64_t local_idx, T& max_val, int64_t& max_idx) {
+    #pragma unroll
+    for (int stride = 16; stride > 0; stride >>= 1) {
+        T other_val = __shfl_down_sync(0xffffffff, local_val, stride);
+        int64_t other_idx = __shfl_down_sync(0xffffffff, local_idx, stride);
+        
+        if (other_val > local_val || (other_val == local_val && other_idx < local_idx)) {
+            local_val = other_val;
+            local_idx = other_idx;
         }
-        return;
     }
 
-    // 1. 每个线程在自己的 strided 区间内找到局部最大值
-    T best_val;
-    int64_t best_idx = -1;
+    if (threadIdx.x % 32 == 0) {
+        max_val = local_val;
+        max_idx = local_idx;
+    }
+}
 
-    size_t i = tid;
-    if (i < numel) {
-        best_val = vals[i];
-        best_idx = static_cast<int64_t>(i);
-        i += stride;
-        for (; i < numel; i += stride) {
-            float cur = to_float(vals[i]);
-            float best = to_float(best_val);
-            if (cur > best) {
-                best_val = vals[i];
-                best_idx = static_cast<int64_t>(i);
-            }
+template <typename T, const int BLOCK_SIZE>
+__global__ void argmax_kernel(int64_t *max_idx, T *max_val, const T *vals, size_t numel) {
+    constexpr int warp_per_block = BLOCK_SIZE / 32;
+
+    int tid = threadIdx.x;
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+
+    __shared__ T vals_shared[warp_per_block];
+    __shared__ int64_t idxs_shared[warp_per_block];
+    
+    // 0. 线程级别求局部最大值
+    T thread_max_val = static_cast<T>(-INFINITY);
+    int64_t thread_max_idx = -1;    
+    for (int i = tid; i < numel; i += blockDim.x) {
+        T local_val = vals[i];
+        if (local_val > thread_max_val || (local_val == thread_max_val && i < thread_max_idx)){
+            thread_max_val = local_val;
+            thread_max_idx = i;
         }
-    } else {
-        best_val = zero_value<T>();
     }
 
-    s_vals[tid] = best_val;
-    s_idx[tid] = best_idx;
+    // 1.warp内规约
+    T warp_max_val = thread_max_val;
+    int64_t warp_max_idx = thread_max_idx;
+    warp_argmax(thread_max_val, thread_max_idx, warp_max_val, warp_max_idx);
+
+    if (lane_id == 0) {
+        vals_shared[warp_id] = warp_max_val;
+        idxs_shared[warp_id] = warp_max_idx;
+    }
     __syncthreads();
 
-    // 2. block 内规约
-    for (unsigned int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
-        if (tid < offset) {
-            int64_t idx_other = s_idx[tid + offset];
-            if (idx_other >= 0) {
-                float v_self = to_float(s_vals[tid]);
-                float v_other = to_float(s_vals[tid + offset]);
-                if (s_idx[tid] < 0 || v_other > v_self) {
-                    s_vals[tid] = s_vals[tid + offset];
-                    s_idx[tid] = idx_other;
-                }
-            }
-        }
-        __syncthreads();
-    }
-
-    // 3. 写出结果
-    if (tid == 0) {
-        if (s_idx[0] < 0) {
-            *out_idx = 0;
-            *out_val = zero_value<T>();
-        } else {
-            *out_idx = s_idx[0];
-            *out_val = s_vals[0];
+    // 2. 用 warp 0 对共享内存里的各 warp 结果做规约，得到 block 的全局最大，再由 lane 0 写回
+    if (warp_id == 0) {
+        // 每个 lane 持有一个候选
+        T lane_val = lane_id < warp_per_block ? vals_shared[lane_id] : static_cast<T>(-INFINITY);
+        int64_t lane_idx = lane_id < warp_per_block ? idxs_shared[lane_id] : -1;
+        T final_val;
+        int64_t final_idx;
+        warp_argmax(lane_val, lane_idx, final_val, final_idx);
+        if (lane_id == 0) {
+            *max_val = final_val;
+            *max_idx = final_idx;
         }
     }
 }
@@ -115,68 +76,52 @@ __global__ void argmax_kernel(const T *vals, size_t numel, int64_t *out_idx, T *
 
 namespace llaisys::ops::nvidia {
 
-void argmax(int64_t *max_idx, std::byte *max_val, const std::byte *vals, llaisysDataType_t type, size_t numel) {
+void argmax(int64_t* max_idx, std::byte* max_val, const std::byte* vals, llaisysDataType_t type, size_t numel) {
+    // 特殊处理空张量的情况：max_val 是 std::byte*，需按类型写入
     if (numel == 0) {
-        // 在 device 上直接写一个默认值
-        // 这里假定 max_idx/max_val 已在 device 上分配
+        *max_idx = 0;
         switch (type) {
-        case LLAISYS_DTYPE_F32: {
-            float zero = 0.0f;
-            CUDA_CHECK(cudaMemcpy(max_val, &zero, sizeof(float), cudaMemcpyHostToDevice));
+        case LLAISYS_DTYPE_F32:
+            *reinterpret_cast<float*>(max_val) = 0.0f;
             break;
-        }
-        case LLAISYS_DTYPE_F16: {
-            llaisys::fp16_t zero{0};
-            CUDA_CHECK(cudaMemcpy(max_val, &zero, sizeof(llaisys::fp16_t), cudaMemcpyHostToDevice));
+        case LLAISYS_DTYPE_F16:
+            *reinterpret_cast<half*>(max_val) = __float2half(0.0f);
             break;
-        }
-        case LLAISYS_DTYPE_BF16: {
-            llaisys::bf16_t zero{0};
-            CUDA_CHECK(cudaMemcpy(max_val, &zero, sizeof(llaisys::bf16_t), cudaMemcpyHostToDevice));
+        case LLAISYS_DTYPE_BF16:
+            *reinterpret_cast<__nv_bfloat16*>(max_val) = __float2bfloat16(0.0f);
             break;
-        }
         default:
             EXCEPTION_UNSUPPORTED_DATATYPE(type);
         }
-        int64_t idx_zero = 0;
-        CUDA_CHECK(cudaMemcpy(max_idx, &idx_zero, sizeof(int64_t), cudaMemcpyHostToDevice));
         return;
     }
 
-    constexpr int block_size = 256;
-    dim3 block(block_size);
-    dim3 grid(1);
-
+    const int block_size = 256;
+    const int grid_size = CEIL(numel, block_size);
+    
     switch (type) {
-    case LLAISYS_DTYPE_F32: {
-        size_t shmem = block_size * (sizeof(float) + sizeof(int64_t));
-        argmax_kernel<<<grid, block, shmem>>>(reinterpret_cast<const float *>(vals),
-                                              numel,
-                                              max_idx,
-                                              reinterpret_cast<float *>(max_val));
+    case LLAISYS_DTYPE_F32:
+        argmax_kernel<float, block_size><<<grid_size, block_size>>>(max_idx, 
+                                                                                      reinterpret_cast<float*>(max_val), 
+                                                                                      reinterpret_cast<const float*>(vals), 
+                                                                                      numel);
         break;
-    }
-    case LLAISYS_DTYPE_F16: {
-        size_t shmem = block_size * (sizeof(llaisys::fp16_t) + sizeof(int64_t));
-        argmax_kernel<<<grid, block, shmem>>>(reinterpret_cast<const llaisys::fp16_t *>(vals),
-                                              numel,
-                                              max_idx,
-                                              reinterpret_cast<llaisys::fp16_t *>(max_val));
+    case LLAISYS_DTYPE_F16:
+        argmax_kernel<half, block_size><<<grid_size, block_size>>>(max_idx, 
+                                                                   reinterpret_cast<half*>(max_val), 
+                                                                   reinterpret_cast<const half*>(vals), 
+                                                                   numel);
         break;
-    }
-    case LLAISYS_DTYPE_BF16: {
-        size_t shmem = block_size * (sizeof(llaisys::bf16_t) + sizeof(int64_t));
-        argmax_kernel<<<grid, block, shmem>>>(reinterpret_cast<const llaisys::bf16_t *>(vals),
-                                              numel,
-                                              max_idx,
-                                              reinterpret_cast<llaisys::bf16_t *>(max_val));
+    case LLAISYS_DTYPE_BF16:
+        argmax_kernel<__nv_bfloat16, block_size><<<grid_size, block_size>>>(max_idx,
+                                                                            reinterpret_cast<__nv_bfloat16*>(max_val), 
+                                                                            reinterpret_cast<const __nv_bfloat16*>(vals),
+                                                                            numel);
         break;
-    }
     default:
         EXCEPTION_UNSUPPORTED_DATATYPE(type);
     }
 
-    CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 

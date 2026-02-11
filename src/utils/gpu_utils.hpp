@@ -1,4 +1,4 @@
-#if defined(ENABLE_NVIDIA_API) && defined(__CUDACC__)
+#if defined(ENABLE_NVIDIA_API)
 
 #include <cuda_runtime.h>
 
@@ -20,6 +20,32 @@ inline void _cudaCheck(cudaError_t err, const char* file, int line) {
         std::cerr << "[CUDA Error] " << cudaGetErrorString(err) << " at " << file << ":" << line << std::endl;
         throw std::runtime_error(cudaGetErrorString(err));
     }
+}
+
+template <typename T>
+__device__ __forceinline__ float to_float(T v) {
+    return static_cast<float>(v);
+}
+template <>
+__device__ __forceinline__ float to_float(half v) {
+    return __half2float(v);
+}
+template <>
+__device__ __forceinline__ float to_float(__nv_bfloat16 v) {
+    return __bfloat162float(v);
+}
+
+template <typename T>
+__device__ __forceinline__ T from_float(float v) {
+    return static_cast<T>(v);
+}
+template <>
+__device__ __forceinline__ half from_float<half>(float v) {
+    return __float2half(v);
+}
+template <>
+__device__ __forceinline__ __nv_bfloat16 from_float<__nv_bfloat16>(float v) {
+    return __float2bfloat16(v);
 }
 
 #endif // ENABLE_NVIDIA_API

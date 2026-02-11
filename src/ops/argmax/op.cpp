@@ -4,7 +4,7 @@
 #include "../../utils.hpp"
 
 #include "cpu/argmax_cpu.hpp"
-#include "nvidia/argmax_nvidia.hpp"
+#include "nvidia/argmax_nvidia.cuh"
 #include "llaisys.h"
 
 // 参数检验+设备分发
