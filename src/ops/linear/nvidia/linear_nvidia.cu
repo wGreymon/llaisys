@@ -281,14 +281,13 @@ __global__ void sgemm_v4(T *out, const T *in, const T *weight, const T *bias,
     }
 }
 
-// v5（借鉴 matmul4/matmul5 思路）：
 // 1) global->shared 使用 float4 向量化加载
 // 2) shared 中转置存储为 [BK, BM]/[BK, BN]，便于 thread-tile 连续读取
 // 3) shared->register 用 float4 一次取 4 个元素，继续提高复用
 // 4) 保留边界检查与尾块标量回退，保证通用输入尺寸正确
 // Torch time: 2.01833 ms
 // LLAISYS time: 4.00644 ms
-__global__ void sgemm_v5_float(float *out, const float *in, const float *weight, const float *bias,
+__global__ void sgemm_v5_float32(float *out, const float *in, const float *weight, const float *bias,
                                size_t M, size_t N, size_t K) {
     constexpr int BM = 32;
     constexpr int BN = 32;
@@ -463,9 +462,205 @@ __global__ void sgemm_v5_bfloat16(__nv_bfloat16 *out, const __nv_bfloat16 *in, c
     constexpr int TN = 4;
 }
 
-template <typename T>
-__global__ void sgemm_v6(T *out, const T *in, const T *weight, const T *bias,
-                         size_t M, size_t N, size_t K) {}
+// v6: 基于 v5_float 添加双缓冲（Double Buffering）
+// 在计算当前 tile 时预加载下一个 tile，隐藏内存访问延迟
+__global__ void sgemm_v6_float32(float *out, const float *in, const float *weight, const float *bias,
+                               size_t M, size_t N, size_t K) {
+    constexpr int BM = 32;
+    constexpr int BN = 32;
+    constexpr int BK = 16;
+    constexpr int TM = 4;
+    constexpr int TN = 4;
+    constexpr int VEC = 4;
+    constexpr int BKV = (BK + VEC - 1) / VEC;
+
+    const int bx = blockIdx.x;
+    const int by = blockIdx.y;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int tid = ty * blockDim.x + tx;
+    const int nthread = blockDim.x * blockDim.y;
+
+    const int block_row_base = by * BM;
+    const int block_col_base = bx * BN;
+    const int out_row_base = by * BM + ty * TM;
+    const int out_col_base = bx * BN + tx * TN;
+
+    // Double buffer: 两套 shared memory
+    __shared__ float As[2][BK][BM];
+    __shared__ float Ws[2][BK][BN];
+
+    float sum[TM][TN] = {0.0f};
+
+    // Initialize accumulators with bias.
+    for (int i = 0; i < TM; i++) {
+        for (int j = 0; j < TN; j++) {
+            const int out_c = out_col_base + j;
+            sum[i][j] = (bias != nullptr && out_c < static_cast<int>(N)) ? bias[out_c] : 0.0f;
+        }
+    }
+
+    // 第一个 tile 加载到 buffer 0
+    int k0 = 0;
+    {
+        // Load A tile + transpose into As[0]
+        for (int idx = tid; idx < BM * BKV; idx += nthread) {
+            const int r = idx / BKV;
+            const int vc = idx % BKV;
+            const int c = vc * VEC;
+            const int gr = block_row_base + r;
+            const int gc = k0 + c;
+
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (gr < static_cast<int>(M)) {
+                const size_t base = static_cast<size_t>(gr) * K + static_cast<size_t>(gc);
+                if (gc + (VEC - 1) < static_cast<int>(K) && (base % VEC) == 0) {
+                    v = *reinterpret_cast<const float4 *>(in + base);
+                } else {
+                    if (gc + 0 < static_cast<int>(K)) v.x = in[base + 0];
+                    if (gc + 1 < static_cast<int>(K)) v.y = in[base + 1];
+                    if (gc + 2 < static_cast<int>(K)) v.z = in[base + 2];
+                    if (gc + 3 < static_cast<int>(K)) v.w = in[base + 3];
+                }
+            }
+            if (c + 0 < BK) As[0][c + 0][r] = v.x;
+            if (c + 1 < BK) As[0][c + 1][r] = v.y;
+            if (c + 2 < BK) As[0][c + 2][r] = v.z;
+            if (c + 3 < BK) As[0][c + 3][r] = v.w;
+        }
+
+        // Load W tile + transpose into Ws[0]
+        for (int idx = tid; idx < BN * BKV; idx += nthread) {
+            const int r = idx / BKV;
+            const int vc = idx % BKV;
+            const int c = vc * VEC;
+            const int gr = block_col_base + r;
+            const int gc = k0 + c;
+
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (gr < static_cast<int>(N)) {
+                const size_t base = static_cast<size_t>(gr) * K + static_cast<size_t>(gc);
+                if (gc + (VEC - 1) < static_cast<int>(K) && (base % VEC) == 0) {
+                    v = *reinterpret_cast<const float4 *>(weight + base);
+                } else {
+                    if (gc + 0 < static_cast<int>(K)) v.x = weight[base + 0];
+                    if (gc + 1 < static_cast<int>(K)) v.y = weight[base + 1];
+                    if (gc + 2 < static_cast<int>(K)) v.z = weight[base + 2];
+                    if (gc + 3 < static_cast<int>(K)) v.w = weight[base + 3];
+                }
+            }
+            if (c + 0 < BK) Ws[0][c + 0][r] = v.x;
+            if (c + 1 < BK) Ws[0][c + 1][r] = v.y;
+            if (c + 2 < BK) Ws[0][c + 2][r] = v.z;
+            if (c + 3 < BK) Ws[0][c + 3][r] = v.w;
+        }
+    }
+    __syncthreads();
+
+    // 主循环：双缓冲
+    int read_buf = 0;
+    for (k0 = BK; k0 < static_cast<int>(K); k0 += BK) {
+        int write_buf = read_buf ^ 1;
+
+        // 并行：加载下一个 tile 到 write_buf + 使用 read_buf 计算
+        {
+            // Load A tile into write_buf
+            for (int idx = tid; idx < BM * BKV; idx += nthread) {
+                const int r = idx / BKV;
+                const int vc = idx % BKV;
+                const int c = vc * VEC;
+                const int gr = block_row_base + r;
+                const int gc = k0 + c;
+
+                float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (gr < static_cast<int>(M)) {
+                    const size_t base = static_cast<size_t>(gr) * K + static_cast<size_t>(gc);
+                    if (gc + (VEC - 1) < static_cast<int>(K) && (base % VEC) == 0) {
+                        v = *reinterpret_cast<const float4 *>(in + base);
+                    } else {
+                        if (gc + 0 < static_cast<int>(K)) v.x = in[base + 0];
+                        if (gc + 1 < static_cast<int>(K)) v.y = in[base + 1];
+                        if (gc + 2 < static_cast<int>(K)) v.z = in[base + 2];
+                        if (gc + 3 < static_cast<int>(K)) v.w = in[base + 3];
+                    }
+                }
+                if (c + 0 < BK) As[write_buf][c + 0][r] = v.x;
+                if (c + 1 < BK) As[write_buf][c + 1][r] = v.y;
+                if (c + 2 < BK) As[write_buf][c + 2][r] = v.z;
+                if (c + 3 < BK) As[write_buf][c + 3][r] = v.w;
+            }
+
+            // Load W tile into write_buf
+            for (int idx = tid; idx < BN * BKV; idx += nthread) {
+                const int r = idx / BKV;
+                const int vc = idx % BKV;
+                const int c = vc * VEC;
+                const int gr = block_col_base + r;
+                const int gc = k0 + c;
+
+                float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (gr < static_cast<int>(N)) {
+                    const size_t base = static_cast<size_t>(gr) * K + static_cast<size_t>(gc);
+                    if (gc + (VEC - 1) < static_cast<int>(K) && (base % VEC) == 0) {
+                        v = *reinterpret_cast<const float4 *>(weight + base);
+                    } else {
+                        if (gc + 0 < static_cast<int>(K)) v.x = weight[base + 0];
+                        if (gc + 1 < static_cast<int>(K)) v.y = weight[base + 1];
+                        if (gc + 2 < static_cast<int>(K)) v.z = weight[base + 2];
+                        if (gc + 3 < static_cast<int>(K)) v.w = weight[base + 3];
+                    }
+                }
+                if (c + 0 < BK) Ws[write_buf][c + 0][r] = v.x;
+                if (c + 1 < BK) Ws[write_buf][c + 1][r] = v.y;
+                if (c + 2 < BK) Ws[write_buf][c + 2][r] = v.z;
+                if (c + 3 < BK) Ws[write_buf][c + 3][r] = v.w;
+            }
+        }
+
+        // 使用 read_buf 进行计算
+        for (int kk = 0; kk < BK; kk++) {
+            const float4 a4 = *reinterpret_cast<const float4 *>(&As[read_buf][kk][ty * TM]);
+            const float4 b4 = *reinterpret_cast<const float4 *>(&Ws[read_buf][kk][tx * TN]);
+            const float a_frag[TM] = {a4.x, a4.y, a4.z, a4.w};
+            const float b_frag[TN] = {b4.x, b4.y, b4.z, b4.w};
+            for (int i = 0; i < TM; i++) {
+                for (int j = 0; j < TN; j++) {
+                    sum[i][j] += a_frag[i] * b_frag[j];
+                }
+            }
+        }
+
+        __syncthreads();
+        read_buf ^= 1;
+    }
+
+    // 最后一个 tile：只用 read_buf 计算
+    for (int kk = 0; kk < BK; kk++) {
+        const float4 a4 = *reinterpret_cast<const float4 *>(&As[read_buf][kk][ty * TM]);
+        const float4 b4 = *reinterpret_cast<const float4 *>(&Ws[read_buf][kk][tx * TN]);
+        const float a_frag[TM] = {a4.x, a4.y, a4.z, a4.w};
+        const float b_frag[TN] = {b4.x, b4.y, b4.z, b4.w};
+        for (int i = 0; i < TM; i++) {
+            for (int j = 0; j < TN; j++) {
+                sum[i][j] += a_frag[i] * b_frag[j];
+            }
+        }
+    }
+
+    // Write back
+    for (int i = 0; i < TM; i++) {
+        const int out_r = out_row_base + i;
+        if (out_r >= static_cast<int>(M)) {
+            continue;
+        }
+        for (int j = 0; j < TN; j++) {
+            const int out_c = out_col_base + j;
+            if (out_c < static_cast<int>(N)) {
+                out[out_r * static_cast<int>(N) + out_c] = sum[i][j];
+            }
+        }
+    }
+}
 
 } // namespace
 
@@ -473,25 +668,29 @@ namespace llaisys::ops::nvidia {
 void linear(std::byte *out, const std::byte *in, const std::byte *weight,
             const std::byte *bias, llaisysDataType_t type, size_t M, size_t N,
             size_t K) {
-    // v3: block tile 32x32, thread tile 4x4 -> (8,8) threads per block
-    constexpr dim3 block_size(8, 8);
-    dim3 grid_size(CEIL(N, 32), CEIL(M, 32));
+    // v4/v5: block tile 32x32, thread tile 4x4 -> (8,8) threads per block
+    constexpr dim3 block_size_v5(8, 8);
+    dim3 grid_size_v5(CEIL(N, 32), CEIL(M, 32));
+
+    // v6: double buffering, BM=32, BN=32 (same as v5 for fair comparison)
+    constexpr dim3 block_size_v6(8, 8);
+    dim3 grid_size_v6(CEIL(N, 32), CEIL(M, 32));
 
     switch (type) {
     case LLAISYS_DTYPE_F32:
-        sgemm_v5_float<<<grid_size, block_size>>>(
+        sgemm_v6_float32<<<grid_size_v6, block_size_v6>>>(
             reinterpret_cast<float *>(out), reinterpret_cast<const float *>(in),
             reinterpret_cast<const float *>(weight),
             reinterpret_cast<const float *>(bias), M, N, K);
         break;
     case LLAISYS_DTYPE_F16:
-        sgemm_v4<half><<<grid_size, block_size>>>(
+        sgemm_v4<half><<<grid_size_v5, block_size_v5>>>(
             reinterpret_cast<half *>(out), reinterpret_cast<const half *>(in),
             reinterpret_cast<const half *>(weight),
             reinterpret_cast<const half *>(bias), M, N, K);
         break;
     case LLAISYS_DTYPE_BF16:
-        sgemm_v4<__nv_bfloat16><<<grid_size, block_size>>>(
+        sgemm_v4<__nv_bfloat16><<<grid_size_v5, block_size_v5>>>(
             reinterpret_cast<__nv_bfloat16 *>(out),
             reinterpret_cast<const __nv_bfloat16 *>(in),
             reinterpret_cast<const __nv_bfloat16 *>(weight),
