@@ -18,6 +18,7 @@ import torch
 class Qwen2:
     def __init__(self, model_path, device: DeviceType = DeviceType.CPU):
         model_path = Path(model_path)
+        self._device = device
         
         # 加载模型配置
         config_path = model_path / "config.json"   # '/'拼接路径
@@ -91,7 +92,7 @@ class Qwen2:
 
         def load_llaisys_tensor_from_torch(t: torch.Tensor) -> Tensor:
             t_cpu = to_bf16_cpu_contig(t)
-            lt = Tensor(shape=list(t_cpu.shape), dtype=DataType.BF16, device=DeviceType.CPU)
+            lt = Tensor(shape=list(t_cpu.shape), dtype=DataType.BF16, device=self._device)
             lt.load(c_void_p(t_cpu.data_ptr()))
             self._weight_tensors.append(lt)
             return lt

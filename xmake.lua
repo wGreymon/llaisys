@@ -151,6 +151,7 @@ target("llaisys")
     end
     if has_config("nv-gpu") then
         add_syslinks("cudart")
+        add_syslinks("cublas")
     end
     add_files("src/llaisys/*.cc")
     add_files("src/models/qwen2/*.cpp")

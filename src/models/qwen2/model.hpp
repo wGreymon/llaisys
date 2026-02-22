@@ -85,10 +85,9 @@ private:
     tensor_t up_;                     // MLP up [seqlen, di]
     tensor_t mlp_out_;                // MLP 输出 [seqlen, hs]
     tensor_t logits_;                // 输出 logits [seqlen, voc]
-    tensor_t pos_ids_;               // 位置 ID [total_len]
     
     // 前向传播辅助函数
-    void forward_layer(size_t layer_idx, tensor_t& x, size_t seqlen, size_t total_len);
+    void forward_layer(size_t layer_idx, tensor_t& x, size_t seqlen, size_t total_len, tensor_t pos_ids_q);
     void update_kv_cache(size_t layer_idx, tensor_t k_new, tensor_t v_new, size_t seqlen, size_t old_len);
     
 public:

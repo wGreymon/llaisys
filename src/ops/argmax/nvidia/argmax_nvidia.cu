@@ -122,7 +122,7 @@ void argmax(int64_t* max_idx, std::byte* max_val, const std::byte* vals, llaisys
         EXCEPTION_UNSUPPORTED_DATATYPE(type);
     }
 
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace llaisys::ops::nvidia

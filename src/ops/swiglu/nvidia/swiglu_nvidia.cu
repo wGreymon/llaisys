@@ -41,6 +41,6 @@ void swiglu(std::byte *out, const std::byte *gate, const std::byte *up,
         EXCEPTION_UNSUPPORTED_DATATYPE(type);
     }
 
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaGetLastError());
 }
 } // namespace llaisys::ops::nvidia

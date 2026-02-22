@@ -115,6 +115,6 @@ void rms_norm(std::byte *out, const std::byte *in, const std::byte *weight,
   default:
     EXCEPTION_UNSUPPORTED_DATATYPE(type);
   }
-  CUDA_CHECK(cudaDeviceSynchronize());
+  CUDA_CHECK(cudaGetLastError());
 }
 } // namespace llaisys::ops::nvidia

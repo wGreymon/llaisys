@@ -93,12 +93,12 @@ void Model::update_kv_cache(size_t layer_idx, tensor_t k_new, tensor_t v_new, si
     ASSERT(k_slice->numel() == k_new->numel() && v_slice->numel() == v_new->numel(),
            "update_kv_cache: slice size must match new tensor size");
     
-    // 使用运行时 API 的内存拷贝（支持设备间拷贝）
-    api->memcpy_sync(k_slice->data(), k_new->data(), k_size, LLAISYS_MEMCPY_H2D);
-    api->memcpy_sync(v_slice->data(), v_new->data(), v_size, LLAISYS_MEMCPY_H2D);
+    // cache/new 都在同一设备上，使用 D2D
+    api->memcpy_sync(k_slice->data(), k_new->data(), k_size, LLAISYS_MEMCPY_D2D);
+    api->memcpy_sync(v_slice->data(), v_new->data(), v_size, LLAISYS_MEMCPY_D2D);
 }
 
-void Model::forward_layer(size_t layer_idx, tensor_t& x, size_t seqlen, size_t total_len) {
+void Model::forward_layer(size_t layer_idx, tensor_t& x, size_t seqlen, size_t total_len, tensor_t pos_ids_q) {
     // 设置设备上下文
     llaisys::core::context().setDevice(device_type_, device_id_);
     
@@ -134,45 +134,24 @@ void Model::forward_layer(size_t layer_idx, tensor_t& x, size_t seqlen, size_t t
     k_ = k_flat->view({seqlen, meta_.nkvh, meta_.dh});
     v_ = v_flat->view({seqlen, meta_.nkvh, meta_.dh});
     
-    // 2.2 更新 KV Cache（先更新，再使用）
-    size_t old_len = total_len - seqlen;
-    update_kv_cache(layer_idx, k_, v_, seqlen, old_len);
-    
-    // 2.3 准备完整的 K 和 V（包含 cache）
-    // 从 cache 中切片出 total_len 长度的部分（包含新写入的数据）
-    tensor_t k_cache_slice = k_cache_[layer_idx]->slice(0, 0, total_len);
-    tensor_t v_cache_slice = v_cache_[layer_idx]->slice(0, 0, total_len);
-    
-    k_full_ = k_cache_slice;
-    v_full_ = v_cache_slice;
-    
-    // 2.4 RoPE
+    // 2.2 RoPE（只处理本轮新增 token）
     tensor_t q_rope = Tensor::create({seqlen, meta_.nh, meta_.dh}, meta_.dtype, device_type_, device_id_);
-    tensor_t k_rope = Tensor::create({total_len, meta_.nkvh, meta_.dh}, meta_.dtype, device_type_, device_id_);
-    
-    // 为 RoPE 准备位置 ID
-    pos_ids_ = Tensor::create({total_len}, LLAISYS_DTYPE_I64, device_type_, device_id_);
-    int64_t* pos_ids_data = reinterpret_cast<int64_t*>(pos_ids_->data());
-    for (size_t i = 0; i < total_len; ++i) {
-        pos_ids_data[i] = static_cast<int64_t>(i);
-    }
-    
-    // 对 K 应用 RoPE（使用 total_len 的位置）
-    ops::rope(k_rope, k_full_, pos_ids_, meta_.theta);
-    
-    // 对 Q 应用 RoPE（只使用 seqlen 的位置，但位置从 total_len-seqlen 开始）
-    tensor_t pos_ids_q = Tensor::create({seqlen}, LLAISYS_DTYPE_I64, device_type_, device_id_);
-    int64_t* pos_ids_q_data = reinterpret_cast<int64_t*>(pos_ids_q->data());
-    size_t start_pos = total_len - seqlen;
-    for (size_t i = 0; i < seqlen; ++i) {
-        pos_ids_q_data[i] = static_cast<int64_t>(start_pos + i);
-    }
+    tensor_t k_rope_new = Tensor::create({seqlen, meta_.nkvh, meta_.dh}, meta_.dtype, device_type_, device_id_);
+    ops::rope(k_rope_new, k_, pos_ids_q, meta_.theta);
     ops::rope(q_rope, q_, pos_ids_q, meta_.theta);
+
+    // 2.3 更新 KV Cache（K 使用 RoPE 后结果，V 保持原值）
+    size_t old_len = total_len - seqlen;
+    update_kv_cache(layer_idx, k_rope_new, v_, seqlen, old_len);
+
+    // 2.4 准备完整的 K 和 V（包含 cache）
+    k_full_ = k_cache_[layer_idx]->slice(0, 0, total_len);
+    v_full_ = v_cache_[layer_idx]->slice(0, 0, total_len);
     
     // 2.5 Self-attention
     attn_out_ = Tensor::create({seqlen, meta_.nh, meta_.dh}, meta_.dtype, device_type_, device_id_);
     float scale = 1.0f / std::sqrt(static_cast<float>(meta_.dh));
-    ops::self_attention(attn_out_, q_rope, k_rope, v_full_, scale);
+    ops::self_attention(attn_out_, q_rope, k_full_, v_full_, scale);
     
     // 2.6 Attention output projection
     // attn_out: [seqlen, nh, dh] -> [seqlen, nh * dh]
@@ -217,16 +196,25 @@ tensor_t Model::forward(tensor_t input_ids, size_t seqlen, size_t total_len) {
     x_ = Tensor::create({seqlen, meta_.hs}, meta_.dtype, device_type_, device_id_);
     ops::embedding(x_, input_ids, weights_.in_embed);
     
-    // 2. Transformer layers
-    for (size_t i = 0; i < meta_.nlayer; ++i) {
-        forward_layer(i, x_, seqlen, total_len);
+    // 2. 本轮所有层复用同一份 pos_ids（避免每层重复构造与拷贝）
+    tensor_t pos_ids_q = Tensor::create({seqlen}, LLAISYS_DTYPE_I64, device_type_, device_id_);
+    std::vector<int64_t> pos_ids_q_host(seqlen);
+    size_t start_pos = total_len - seqlen;
+    for (size_t i = 0; i < seqlen; ++i) {
+        pos_ids_q_host[i] = static_cast<int64_t>(start_pos + i);
     }
-    
-    // 3. Output norm
+    pos_ids_q->load(pos_ids_q_host.data());
+
+    // 3. Transformer layers
+    for (size_t i = 0; i < meta_.nlayer; ++i) {
+        forward_layer(i, x_, seqlen, total_len, pos_ids_q);
+    }
+
+    // 4. Output norm
     x_norm_ = Tensor::create({seqlen, meta_.hs}, meta_.dtype, device_type_, device_id_);
     ops::rms_norm(x_norm_, x_, weights_.out_norm_w, meta_.epsilon);
-    
-    // 4. Output projection (logits)
+
+    // 5. Output projection (logits)
     logits_ = Tensor::create({seqlen, meta_.voc}, meta_.dtype, device_type_, device_id_);
     // out_embed 应该是 [voc, hs]，linear 计算 Y = X W^T，所以 Y = [seqlen, voc]
     ops::linear(logits_, x_norm_, weights_.out_embed, dummy_bias_voc_);
@@ -264,9 +252,6 @@ int64_t Model::infer(int64_t* token_ids, size_t ntoken) {
     tensor_t max_idx = Tensor::create({1}, LLAISYS_DTYPE_I64, device_type_, device_id_);
     tensor_t max_val = Tensor::create({1}, meta_.dtype, device_type_, device_id_);
     ops::argmax(max_idx, max_val, last_logits);
-    
-    // 同步设备，确保数据已写入
-    llaisys::core::context().runtime().api()->device_synchronize();
     
     // 将结果从设备拷贝回主机
     std::vector<int64_t> host_result(1);

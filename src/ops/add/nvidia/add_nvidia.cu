@@ -90,7 +90,7 @@ void add(std::byte *c, const std::byte *a, const std::byte *b, llaisysDataType_t
         EXCEPTION_UNSUPPORTED_DATATYPE(type);
     }
 
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace llaisys::ops::nvidia
